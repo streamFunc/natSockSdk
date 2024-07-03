@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/gorilla/websocket"
+	"github.com/klauspost/reedsolomon"
 	"github.com/pion/ice/v3"
 	"github.com/pion/logging"
 	"github.com/pion/stun/v2"
@@ -15,18 +16,22 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
 	defaultStunServer = "stun:stun1.l.google.com:19302"
-
-	ufrag = "abcdefghijklmnopqrst"
-	pwd   = "passwordpassword"
+	ufrag             = "abcdefghijklmnopqrst"
+	pwd               = "passwordpassword"
 )
 
 type signalHandler func(info *pairInfo)
+
+var GlobalFecConfig bool
+var MyDataShards = 3
+var MyParityShards = 2
 
 var (
 	logFactory = logging.NewDefaultLoggerFactory()
@@ -36,11 +41,17 @@ var (
 
 	gateWay    IceGateway
 	gateWayMap map[string]IceGateway
+
+	roomDataLock sync.Mutex
+
+	tempData []byte
+
+	packetSeqNum = uint32(1)
 )
 
 type MsgDataCallback interface {
-	//OnDataReceived(data string)
-	OnDataReceivedByte(data []byte)
+	//OnDataReceived(data string,room string))
+	OnDataReceivedByte(data []byte, room string)
 }
 
 func RegisterIceCallback(callback MsgDataCallback) {
@@ -56,6 +67,11 @@ type IceGateway struct {
 	connected        atomic.Value
 	agent            *ice.Agent
 	peerConn         *ice.Conn
+	//listener         *kcp.Listener
+
+	//Encode reedsolomon.Encoder
+
+	//	peerConn1 *kcp.UDPSession
 }
 
 func init() {
@@ -70,8 +86,11 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 	logger.Infof("StartConnect signal server is %v nic:%v stunServer:%v role:%v room:%v ",
 		signalServer, nic, stunServer, role, room)
 
+	//var externPort, externIp string
+
 	gateWay.room = room
 	gateWay.role = role
+	//	gateWay.Encode, _ = reedsolomon.New(MyDataShards, MyParityShards)
 
 	gateWay.agent = createAgent(nic, stunServer, role)
 	conn, _, err := connectSignalServer(signalServer, role, room, gateWay.agent)
@@ -80,6 +99,8 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	fmt.Printf("ctx:%v\n", ctx)
 	//var signalDone atomic.Value
 	gateWay.connected.Store(false)
 	go receiveFromSignal(conn, func(info *pairInfo) {
@@ -90,12 +111,14 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 			return
 		}
 		if len(info.CtrlAddress) > 0 && len(info.CtrledAddress) > 0 {
+			fmt.Printf("info ctrl:%v ctrled:%v", info.CtrlAddress, info.CtrledAddress)
 			var remoteCandidates []string
 			switch role {
 			case "ctrl":
 				remoteCandidates = info.CtrledAddress
 			case "ctrled":
 				remoteCandidates = info.CtrlAddress
+
 			default:
 				panic("wrong role of signal response")
 			}
@@ -103,22 +126,26 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 			addRemote(gateWay.agent, remoteCandidates)
 			gateWay.connected.Store(true)
 
-			//var peerConn *ice.Conn
+			//	var peerConn *ice.Conn
 			var connErr error
 			switch role {
 			case "ctrl":
-				logger.Infof("dialing ...")
+				logger.Infof("dialing:%v ...", info.CtrledAddress[0])
 				gateWay.peerConn, connErr = gateWay.agent.Dial(ctx, ufrag, pwd)
 			case "ctrled":
-				logger.Infof("accepting...")
+				logger.Infof("accepting:%v...", info.CtrlAddress[0])
 				gateWay.peerConn, err = gateWay.agent.Accept(ctx, ufrag, pwd)
 			}
+
+			logger.Infof("candidate size is:%v", len(remoteCandidates))
+
 			if connErr != nil {
 				panic(connErr)
 			}
 
 			gateWay.cancelConnection = cancel
 			gateWayMap[room] = gateWay
+			go SendBufferedData()
 
 			logger.Info("----------------READY-----------------")
 			// write stdin to peer's output, and vice versa
@@ -171,10 +198,10 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 							}
 						}
 
-						gateWay.callback.OnDataReceivedByte(data[:n])
+						gateWay.callback.OnDataReceivedByte(data[:n], room)
 						//gateWay.callback.OnDataReceived(string(data[:n]))
 
-						logger.Infof("--> %v", string(data[:n]))
+						//logger.Infof("--> %v", string(data[:n]))
 					}
 				}
 			}()
@@ -354,7 +381,7 @@ func StartSendMsg(room string, text string) {
 
 }
 
-/*func StartSendH264Byte(room string, data []byte) {
+func StartSendH264ByteAll(room string, data []byte) {
 	if data == nil {
 		logger.Errorf("StartSendH264Byte data nil")
 		return
@@ -368,7 +395,7 @@ func StartSendMsg(room string, text string) {
 	inp := data
 	value.peerConn.Write(inp)
 
-}*/
+}
 
 func StartSendH264Byte(room string, data []byte) {
 	if data == nil {
@@ -382,21 +409,167 @@ func StartSendH264Byte(room string, data []byte) {
 		return
 	}
 
+	if value.peerConn == nil {
+		logger.Errorf("peerConn nil")
+		return
+	}
+
 	inp := bytes.NewBuffer(data)
-	buffer := make([]byte, 1024)
+	buffer := make([]byte, 1200)
+
 	for {
 		n, err := inp.Read(buffer)
 		if err != nil && err != io.EOF {
 			logger.Errorf("StartSendH264Byte error reading input data: %v", err)
-			break
+			return
 		}
 		if err == io.EOF {
-			break
+			return
 		}
 		if n == 0 {
-			break
+			return
 		}
-		value.peerConn.Write(buffer[:n])
+		if GlobalFecConfig {
+			tempData = append(tempData, buffer[:n]...)
+			encodeData, err := Encode(tempData)
+			if err != nil {
+				logger.Errorf("fec encode data fail...")
+				//encodeData = buffer[:n]
+			}
+			seqNum := 0 // 分包序号
+			// 分片发送
+			for _, shard := range encodeData {
+				// 在每个分片的开头添加序号
+				packetInfo := make([]byte, 8)
+				binary.LittleEndian.PutUint32(packetInfo[:4], packetSeqNum)
+				binary.LittleEndian.PutUint32(packetInfo[4:8], uint32(seqNum))
+				shardWithSeq := append(packetInfo, shard...)
+
+				//	fmt.Println("write it len", len(shardWithSeq), len(encodedData))
+				value.peerConn.Write(shardWithSeq)
+				seqNum++
+			}
+			packetSeqNum++
+			tempData = nil
+		} else {
+			packetInfo := make([]byte, 4)
+			binary.LittleEndian.PutUint32(packetInfo[:4], packetSeqNum)
+			shardWithSeq := append(packetInfo, buffer[:n]...)
+			value.peerConn.Write(shardWithSeq)
+			packetSeqNum++
+			//value.peerConn.Write(buffer[:n])
+		}
+	}
+}
+
+// StartReceivedData OnDataReceivedByte
+func StartReceivedData(room string) {
+	value, ok := gateWayMap[room]
+	if !ok {
+		logger.Errorf("not find room:%v", room)
+		return
+	}
+
+	go func() {
+		data := make([]byte, 4096)
+		for {
+			if n, err := value.peerConn.Read(data); err != nil {
+				logger.Errorf("read peer error:%v, n:%v", err, n)
+				return
+			} else {
+				value.callback.OnDataReceivedByte(data[:n], room)
+			}
+		}
+	}()
+}
+
+type BufferedData struct {
+	Room  string
+	Data  []byte
+	mutex sync.Mutex
+}
+
+var bufferedDataMap = make(map[string]*BufferedData)
+
+func SetFecEnable(enabled bool) {
+	GlobalFecConfig = enabled
+}
+
+func StartSendH264ByteQueue(room string, data []byte) {
+	if data == nil {
+		logger.Errorf("StartSendH264Byte data nil")
+		return
+	}
+
+	_, ok := gateWayMap[room]
+	if !ok {
+		logger.Errorf("StartSendH264Byte not find room:%v", room)
+		return
+	}
+
+	bufferedData, exists := bufferedDataMap[room]
+	if !exists {
+		bufferedData = &BufferedData{
+			Room: room,
+		}
+		bufferedDataMap[room] = bufferedData
+	}
+	bufferedData.mutex.Lock()
+	defer bufferedData.mutex.Unlock()
+	bufferedData.Data = append(bufferedData.Data, data...)
+
+}
+
+func SendBufferedData() {
+	ticker := time.Tick(time.Microsecond)
+	for {
+		select {
+		case <-ticker:
+			for room, bufferedData := range bufferedDataMap {
+
+				for len(bufferedData.Data) >= 1200 {
+					bufferedData.mutex.Lock()
+					tempData = append(tempData, bufferedData.Data[:1200]...)
+					bufferedData.Data = bufferedData.Data[1200:]
+					bufferedData.mutex.Unlock()
+					//	fp1.Write(tempData)
+					value, ok := gateWayMap[room]
+					if !ok {
+						continue
+					}
+
+					if GlobalFecConfig {
+						encodeData, err := Encode(tempData)
+						if err != nil {
+							logger.Errorf("fec encode data fail...")
+						}
+
+						seqNum := 0 // 分包序号
+						// 分片发送
+						for _, shard := range encodeData {
+							// 在每个分片的开头添加序号
+							packetInfo := make([]byte, 8)
+							binary.LittleEndian.PutUint32(packetInfo[:4], packetSeqNum)
+							binary.LittleEndian.PutUint32(packetInfo[4:8], uint32(seqNum))
+							shardWithSeq := append(packetInfo, shard...)
+
+							value.peerConn.Write(shardWithSeq)
+							seqNum++
+
+						}
+						packetSeqNum++
+
+					} else {
+						packetInfo := make([]byte, 4)
+						binary.LittleEndian.PutUint32(packetInfo[:4], packetSeqNum)
+						shardWithSeq := append(packetInfo, tempData...)
+						value.peerConn.Write(shardWithSeq)
+						packetSeqNum++
+					}
+					tempData = nil
+				}
+			}
+		}
 	}
 }
 
@@ -428,6 +601,7 @@ func StopAllConnect() {
 		if value.cancelConnection != nil {
 			value.cancelConnection()
 		}
+
 		delete(gateWayMap, key)
 	}
 	gateWayMap = nil
@@ -441,4 +615,76 @@ func IsRoomConnected(room string) bool {
 	}
 	logger.Infof("IsRoomConnected find room:%v", room)
 	return true
+}
+
+func SetFecParm(dataShard, parityShard int) {
+	MyDataShards = dataShard
+	MyParityShards = parityShard
+}
+
+func GetIceGateWay(room string) IceGateway {
+	value, ok := gateWayMap[room]
+	if !ok {
+		logger.Errorf("IsRoomConnected not find room:%v", room)
+	}
+	//logger.Infof("IsRoomConnected find room:%v", room)
+	return value
+}
+
+func Encode(data []byte) ([][]byte, error) {
+
+	enc, err := reedsolomon.New(MyDataShards, MyParityShards)
+	if err != nil {
+		return nil, err
+	}
+
+	shards, err := enc.Split(data)
+	if err != nil {
+		fmt.Println("encode split fail...", err)
+		return nil, err
+	}
+
+	err = enc.Encode(shards)
+	if err != nil {
+		fmt.Println("encode fail...", err)
+		return nil, err
+	}
+
+	//fmt.Println("shards len:", len(shards))
+
+	/*var buffer bytes.Buffer
+	for _, shard := range shards {
+		binary.Write(&buffer, binary.LittleEndian, int32(len(shard)))
+		buffer.Write(shard)
+	}*/
+
+	return shards, nil
+}
+
+func Decode(data [][]byte) error {
+	enc, err := reedsolomon.New(MyDataShards, MyParityShards)
+	if err != nil {
+		return err
+	}
+
+	// Verify the shards
+	ok, err := enc.Verify(data)
+	if ok {
+		fmt.Println("No reconstruction needed")
+	} else {
+		fmt.Println("Verification failed. Reconstructing data")
+		err = enc.Reconstruct(data)
+		if err != nil {
+			fmt.Println("Reconstruct failed:", err)
+			return err
+		}
+		ok, err = enc.Verify(data)
+		if !ok {
+			fmt.Println("Verification failed after reconstruction, data likely corrupted.", err)
+			return err
+		} else {
+			fmt.Println("Verification and Reconstructing data success")
+		}
+	}
+	return nil
 }
