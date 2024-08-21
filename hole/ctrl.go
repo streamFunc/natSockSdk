@@ -1,7 +1,6 @@
 package hole
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -14,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -32,6 +30,8 @@ type signalHandler func(info *pairInfo)
 var GlobalFecConfig bool
 var MyDataShards = 3
 var MyParityShards = 2
+var reConnectedCount int
+var isConnected bool
 
 var (
 	logFactory = logging.NewDefaultLoggerFactory()
@@ -59,19 +59,13 @@ func RegisterIceCallback(callback MsgDataCallback) {
 }
 
 type IceGateway struct {
-	role string // ctrl or ctrled
-	room string
-
+	role             string // ctrl or ctrled
+	room             string
 	callback         MsgDataCallback
 	cancelConnection context.CancelFunc
 	connected        atomic.Value
 	agent            *ice.Agent
 	peerConn         *ice.Conn
-	//listener         *kcp.Listener
-
-	//Encode reedsolomon.Encoder
-
-	//	peerConn1 *kcp.UDPSession
 }
 
 func init() {
@@ -80,6 +74,15 @@ func init() {
 	gateWayMap = make(map[string]IceGateway)
 	logFactory.DefaultLogLevel = logging.LogLevelDebug
 	logger = logFactory.NewLogger("hole")
+	go SendBufferedData()
+}
+
+func reConnectAgain(nic, signalServer, stunServer, role, room string) {
+	if reConnectedCount <= 3 {
+		StopConnect(room)
+		logger.Infof("reConnectAgain now...")
+		StartConnect(nic, signalServer, stunServer, role, room)
+	}
 }
 
 func StartConnect(nic, signalServer, stunServer, role, room string) {
@@ -90,9 +93,11 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 
 	gateWay.room = room
 	gateWay.role = role
+	isConnected = false
+
 	//	gateWay.Encode, _ = reedsolomon.New(MyDataShards, MyParityShards)
 
-	gateWay.agent = createAgent(nic, stunServer, role)
+	gateWay.agent = createAgent(nic, stunServer, signalServer, role, room)
 	conn, _, err := connectSignalServer(signalServer, role, room, gateWay.agent)
 	if err != nil {
 		panic(err)
@@ -145,11 +150,10 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 
 			gateWay.cancelConnection = cancel
 			gateWayMap[room] = gateWay
-			go SendBufferedData()
 
 			logger.Info("----------------READY-----------------")
 			// write stdin to peer's output, and vice versa
-			scanner := bufio.NewScanner(os.Stdin)
+			/*scanner := bufio.NewScanner(os.Stdin)
 			go func() {
 				for scanner.Scan() {
 					select {
@@ -204,7 +208,7 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 						//logger.Infof("--> %v", string(data[:n]))
 					}
 				}
-			}()
+			}()*/
 
 		}
 
@@ -212,7 +216,8 @@ func StartConnect(nic, signalServer, stunServer, role, room string) {
 	//<-ctx.Done()
 }
 
-func createAgent(nic, server, _ string) *ice.Agent {
+func createAgent(nic, server, sigServer, role, room string) *ice.Agent {
+	stunServer := server
 	var username, password string
 	if len(server) == 0 {
 		server = defaultStunServer
@@ -288,6 +293,31 @@ func createAgent(nic, server, _ string) *ice.Agent {
 		logger.Error("ice.NewAgent fail ...")
 		panic(err)
 	}
+
+	err = agent.OnConnectionStateChange(func(c ice.ConnectionState) {
+		switch c {
+		case ice.ConnectionStateChecking:
+			logger.Infof("is ConnectionStateChecking\n")
+		case ice.ConnectionStateConnected:
+			reConnectedCount = 0
+			isConnected = true
+			logger.Infof("is ConnectionStateConnected\n")
+		case ice.ConnectionStateDisconnected:
+			logger.Infof("is ConnectionStateDisconnected\n")
+			isConnected = false
+			go reConnectAgain(nic, sigServer, stunServer, role, room)
+			reConnectedCount++
+		case ice.ConnectionStateFailed:
+			isConnected = false
+			logger.Infof("is ConnectionStateFailed\n")
+			go reConnectAgain(nic, sigServer, stunServer, role, room)
+			reConnectedCount++
+		case ice.ConnectionStateClosed:
+			isConnected = false
+			logger.Infof("is ConnectionStateClosed\n")
+		default:
+		}
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	agent.OnCandidate(func(c ice.Candidate) {
@@ -501,9 +531,13 @@ func StartSendH264ByteQueue(room string, data []byte) {
 		return
 	}
 
+	if isConnected == false {
+		return
+	}
+
 	_, ok := gateWayMap[room]
 	if !ok {
-		logger.Errorf("StartSendH264Byte not find room:%v", room)
+		logger.Errorf("StartSendH264ByteQueue not find room:%v", room)
 		return
 	}
 
@@ -521,17 +555,68 @@ func StartSendH264ByteQueue(room string, data []byte) {
 }
 
 func SendBufferedData() {
-	ticker := time.Tick(time.Microsecond)
+	ticker := time.Tick(time.Millisecond)
+	count := 0
 	for {
 		select {
 		case <-ticker:
 			for room, bufferedData := range bufferedDataMap {
 
-				for len(bufferedData.Data) >= 1200 {
+				if len(bufferedData.Data) > 0 && len(bufferedData.Data) < 1200 {
+					count++
+				}
+
+				if count >= 10 {
+					fmt.Printf("count > 10,send last data\n")
+					count = 0
 					bufferedData.mutex.Lock()
+					tempData = append(tempData, bufferedData.Data...)
+					bufferedData.Data = nil
+
+					value, ok := gateWayMap[room]
+					if !ok {
+						bufferedData.mutex.Unlock()
+						continue
+					}
+
+					if GlobalFecConfig {
+						encodeData, err := Encode(tempData)
+						if err != nil {
+							logger.Errorf("fec encode data fail...")
+						}
+
+						seqNum := 0 // 分包序号
+						// 分片发送
+						for _, shard := range encodeData {
+							// 在每个分片的开头添加序号
+							packetInfo := make([]byte, 8)
+							binary.LittleEndian.PutUint32(packetInfo[:4], packetSeqNum)
+							binary.LittleEndian.PutUint32(packetInfo[4:8], uint32(seqNum))
+							shardWithSeq := append(packetInfo, shard...)
+
+							value.peerConn.Write(shardWithSeq)
+							seqNum++
+
+						}
+						packetSeqNum++
+
+					} else {
+						packetInfo := make([]byte, 4)
+						binary.LittleEndian.PutUint32(packetInfo[:4], packetSeqNum)
+						shardWithSeq := append(packetInfo, tempData...)
+						value.peerConn.Write(shardWithSeq)
+						packetSeqNum++
+					}
+					tempData = nil
+					bufferedData.mutex.Unlock()
+				}
+
+				bufferedData.mutex.Lock()
+				for len(bufferedData.Data) >= 1200 {
+					count = 0
 					tempData = append(tempData, bufferedData.Data[:1200]...)
 					bufferedData.Data = bufferedData.Data[1200:]
-					bufferedData.mutex.Unlock()
+
 					//	fp1.Write(tempData)
 					value, ok := gateWayMap[room]
 					if !ok {
@@ -568,6 +653,7 @@ func SendBufferedData() {
 					}
 					tempData = nil
 				}
+				bufferedData.mutex.Unlock()
 			}
 		}
 	}
@@ -649,6 +735,10 @@ func Encode(data []byte) ([][]byte, error) {
 		fmt.Println("encode fail...", err)
 		return nil, err
 	}
+
+	//模拟丢包
+	//shards[0] = nil
+	//shards[1] = nil
 
 	//fmt.Println("shards len:", len(shards))
 
